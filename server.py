@@ -1,20 +1,23 @@
-# server.py
+
 import os
 import time
-import re
-import requests
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+import json
+import asyncio
+import subprocess
+import shlex
+from typing import List, Optional
 
-HF_TOKEN = os.getenv("HF_TOKEN", "hf_xxx")        # coloque no Railway
-SERP_API_KEY = os.getenv("SERP_API_KEY", "serp_xxx")
-HF_MODEL = os.getenv("HF_MODEL", "gpt2")          # ex: "gpt2" ou outro modelo no HF
-CHUNK_DELAY = float(os.getenv("CHUNK_DELAY", "0.25"))  # segundos entre chunks
+import requests
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+SERP_API_KEY = os.getenv("SERP_API_KEY")
+HF_MODEL = os.getenv("HF_MODEL", "gpt2")
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,147 +26,253 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Health / info
-@app.get("/server-info")
-def server_info():
-    return {"status": "ok", "msg": "Servidor rodando no Railway 🚀"}
+# ---------- utilitários ----------
 
-def search_google(query: str):
-    url = f"https://serpapi.com/search.json?q={query}&hl=pt&api_key={SERP_API_KEY}"
+def search_serpapi(query: str, max_results: int = 5) -> List[str]:
+    """Busca rápida via SerpAPI, retorna lista de URLs candidatas."""
+    if not SERP_API_KEY:
+        return []
     try:
-        res = requests.get(url, timeout=8).json()
-        results = []
-        if "organic_results" in res:
-            for r in res["organic_results"][:5]:
-                results.append(r.get("snippet", ""))
-        return " ".join(results) if results else "Nenhum resultado encontrado."
+        url = f"https://serpapi.com/search.json?q={requests.utils.quote(query)}&hl=pt&api_key={SERP_API_KEY}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        urls = []
+        for item in j.get("organic_results", [])[:max_results]:
+            link = item.get("link") or item.get("url") or item.get("position")
+            if link:
+                urls.append(link)
+        return urls
     except Exception:
-        return "Nenhum resultado (erro ao consultar SerpAPI)."
+        return []
 
-@app.post("/ask")
-async def ask(req: Request):
-    data = await req.json()
-    question = data.get("question", "")
-    context = search_google(question)
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {"inputs": f"P: {question}\nC: {context}\nR:"}
+
+def try_yt_dlp_extract(page_url: str, timeout: int = 30) -> List[str]:
+    """Tenta extrair links com yt-dlp (retorna lista de URLs de vídeo)."""
     try:
-        resp = requests.post(
-            f"https://api-inference.huggingface.co/models/{HF_MODEL}",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        if resp.status_code == 200:
-            answer = resp.json()
-            # tentativa genérica para extrair texto
-            if isinstance(answer, list) and len(answer) > 0 and "generated_text" in answer[0]:
-                text = answer[0]["generated_text"].strip()
-            elif isinstance(answer, dict) and "generated_text" in answer:
-                text = answer["generated_text"].strip()
-            else:
-                # fallback: string representation
-                text = str(answer)
+        cmd = ["yt-dlp", "-j", "--no-warnings", page_url]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=timeout, text=True)
+        info = json.loads(out)
+        formats = info.get("formats") or []
+        candidates = []
+        # coleta urls de formatos
+        for f in formats:
+            url = f.get("url")
+            ext = f.get("ext", "")
+            if url and (url.endswith('.mp4') or '.m3u8' in url or ext in ('mp4', 'm3u8')):
+                candidates.append(url)
+        # dedupe
+        return list(dict.fromkeys(candidates))
+    except subprocess.CalledProcessError:
+        return []
+    except Exception:
+        return []
+
+
+async def playwright_extract(url: str, click_texts: Optional[List[str]] = None, wait_seconds: int = 8) -> List[str]:
+    """Tenta extrair via Playwright: executa JS, clica em botões com textos e intercepta requests.
+    Retorna lista de URLs encontradas (.m3u8/.mp4).
+    """
+    click_texts = click_texts or ["baixar", "download", "downloadar", "baixar agora", "download video", "baixar vídeo"]
+    try:
+        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    except Exception:
+        # Playwright não instalado
+        return []
+
+    found = set()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        async def _on_request(request):
+            rurl = request.url
+            # filtragem básica
+            if rurl.endswith('.mp4') or '.m3u8' in rurl or 'videoplayback' in rurl:
+                found.add(rurl)
+            # também checar content-type se disponível
+        page.on('request', _on_request)
+
+        try:
+            await page.goto(url, timeout=25000)
+            # tentar procurar e clicar em elementos que contenham textos de "baixar"/"download"
+            for txt in click_texts:
+                try:
+                    # busca por texto (insensível a maiúsculas)
+                    locator = page.get_by_text(txt, exact=False)
+                    count = await locator.count()
+                    if count:
+                        for i in range(count):
+                            try:
+                                await locator.nth(i).click(timeout=3000)
+                                await asyncio.sleep(0.5)
+                            except Exception:
+                                pass
+                except PWTimeout:
+                    pass
+                except Exception:
+                    pass
+
+            # esperar tráfego
+            await asyncio.sleep(wait_seconds)
+        finally:
+            await context.close()
+            await browser.close()
+
+    return list(found)
+
+
+# ---------- endpoints ----------
+
+@app.get('/server-info')
+def server_info():
+    return {"status": "ok", "msg": "Servidor pronto", "hf_model": HF_MODEL}
+
+
+@app.post('/extract')
+async def extract_sync(req: Request):
+    """Endpoint rápido: tenta extrair sincronamente (retorna JSON com candidate links)."""
+    payload = await req.json()
+    page_url = payload.get('url')
+    query = payload.get('query')
+    if not page_url and not query:
+        raise HTTPException(status_code=400, detail='Envie `url` ou `query`.')
+
+    candidates = []
+    logs = []
+
+    # se query: faz busca
+    urls_to_try = []
+    if page_url:
+        urls_to_try.append(page_url)
+    elif query:
+        logs.append(f"Buscando no SerpAPI por: {query}")
+        urls_to_try = search_serpapi(query)
+        logs.append(f"Candidatos da busca: {urls_to_try}")
+
+    for u in urls_to_try:
+        logs.append(f"Tentando yt-dlp em: {u}")
+        y = try_yt_dlp_extract(u)
+        if y:
+            logs.append(f"yt-dlp encontrou: {y}")
+            candidates.extend(y)
+            break
         else:
-            text = f"Erro HuggingFace: {resp.status_code} - {resp.text}"
-    except Exception as e:
-        text = f"Erro ao chamar HuggingFace: {e}"
-    return {"answer": text, "context": context}
+            logs.append("yt-dlp não encontrou, tentando Playwright...")
+            try:
+                y2 = await playwright_extract(u)
+                if y2:
+                    logs.append(f"Playwright encontrou: {y2}")
+                    candidates.extend(y2)
+                    break
+                else:
+                    logs.append("Playwright não encontrou neste candidato.")
+            except Exception as e:
+                logs.append(f"Erro Playwright: {e}")
 
-@app.post("/extract")
-async def extract(req: Request):
+    return {"candidates": list(dict.fromkeys(candidates)), "logs": logs}
+
+
+@app.post('/extract_stream')
+async def extract_stream_start(req: Request):
+    """Confirmação para frontend (mantive compat com fluxo POST+SSE)."""
     data = await req.json()
-    url = data.get("url")
-    try:
-        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12).text
-        matches = re.findall(r'(https?://[^\s"\']+\.(?:mp4|m3u8))', html)
-        return {"links": list(set(matches))}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/generate_stream")
-async def generate_stream(req: Request):
-    # O front já faz esse POST antes de abrir o SSE. Mantemos por compatibilidade.
+    # apenas responde OK — frontend deve então abrir o SSE
     return {"status": "ok"}
 
-@app.get("/generate_stream_sse")
-async def generate_stream_sse(prompt: str):
+
+@app.get('/extract_stream_sse')
+async def extract_stream_sse(url: Optional[str] = None, query: Optional[str] = None):
+    """SSE async generator que envia progresso e resultado JSON ao final.
+    Uso: /extract_stream_sse?url=...  ou ?query=...
     """
-    Faz a chamada ao HF (sincrona), pega a resposta completa e envia em 'chunks'
-    via SSE (cada chunk = sentença / bloco). Isso evita as 'Parte 1/2' do exemplo.
-    """
-    def _split_into_chunks(text, max_chars=250):
-        # tenta quebrar por sentenças; se sentenças muito longas, quebra por tamanho
-        parts = re.split(r'(?<=[\.\?\!]\s)', text)
-        out = []
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-            if len(p) <= max_chars:
-                out.append(p)
-            else:
-                # quebra por palavras mantendo tamanho aproximado
-                words = p.split()
-                cur = ""
-                for w in words:
-                    if len(cur) + 1 + len(w) <= max_chars:
-                        cur = (cur + " " + w).strip()
-                    else:
-                        out.append(cur)
-                        cur = w
-                if cur:
-                    out.append(cur)
-        return out
+    async def event_generator():
+        yield f"data: Iniciando extração...\n\n"
+        candidates = []
+        logs = []
 
-    def event_generator():
-        # 1) Chama a HF (pode demorar). Timeout razoável aplicado.
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-        payload = {"inputs": prompt}
-        try:
-            resp = requests.post(
-                f"https://api-inference.huggingface.co/models/{HF_MODEL}",
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-        except Exception as e:
-            yield f"data: Erro ao chamar HuggingFace: {str(e)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        if resp.status_code != 200:
-            yield f"data: Erro HuggingFace {resp.status_code}: {resp.text}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        answer = resp.json()
-        if isinstance(answer, list) and len(answer)>0 and "generated_text" in answer[0]:
-            text = answer[0]["generated_text"].strip()
-        elif isinstance(answer, dict) and "generated_text" in answer:
-            text = answer["generated_text"].strip()
-        elif isinstance(answer, dict) and "text" in answer:
-            text = answer["text"].strip()
+        urls_to_try = []
+        if url:
+            urls_to_try.append(url)
+            logs.append(f"Recebi URL direta: {url}")
+            yield f"data: Recebida URL: {url}\n\n"
+        elif query:
+            logs.append(f"Recebi query: {query}")
+            yield f"data: Buscando no SerpAPI por: {query}\n\n"
+            found_urls = search_serpapi(query)
+            urls_to_try = found_urls
+            yield f"data: Candidatos encontrados: {found_urls}\n\n"
         else:
-            # fallback: stringify
-            text = str(answer)
+            yield f"data: Erro: informe url ou query\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
-        # 2) Quebra em chunks e envia
-        chunks = _split_into_chunks(text, max_chars=200)
-        for c in chunks:
-            # envia um chunk como evento SSE
-            safe = c.replace("\n", " ").strip()
-            yield f"data: {safe}\n\n"
-            time.sleep(CHUNK_DELAY)
-        # 3) finaliza
+        for idx, u in enumerate(urls_to_try):
+            yield f"data: Tentando candidato {idx+1}: {u}\n\n"
+            # yt-dlp
+            yield f"data: Tentando extrair com yt-dlp...\n\n"
+            y = try_yt_dlp_extract(u)
+            if y:
+                yield f"data: Encontrado via yt-dlp: {json.dumps(y)}\n\n"
+                candidates.extend(y)
+                break
+            else:
+                yield f"data: yt-dlp não encontrou, entrando no navegador (Playwright)\n\n"
+                try:
+                    y2 = await playwright_extract(u)
+                    if y2:
+                        yield f"data: Encontrado via Playwright: {json.dumps(y2)}\n\n"
+                        candidates.extend(y2)
+                        break
+                    else:
+                        yield f"data: Playwright não encontrou neste candidato.\n\n"
+                except Exception as e:
+                    yield f"data: Erro Playwright: {e}\n\n"
+
+        # resultado final
+        result = {"candidates": list(dict.fromkeys(candidates)), "logs": logs}
+        yield f"data: RESULT: {json.dumps(result)}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(event_generator(), media_type='text/event-stream')
 
-# Run (usado somente local/colab; Railway usa comando start configurado)
-if __name__ == "__main__":
+
+# --- util endpoint simples de teste do modelo HuggingFace (opcional) ---
+@app.post('/ask')
+async def ask(req: Request):
+    data = await req.json()
+    question = data.get('question', '')
+    context = ''
+    if question:
+        if SERP_API_KEY:
+            context = ' '.join(search_serpapi(question)[:3])
+        # chama HF apenas se token presente
+        if HF_TOKEN:
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+            payload = {"inputs": f"P: {question}\nC: {context}\nR:"}
+            try:
+                r = requests.post(f"https://api-inference.huggingface.co/models/{HF_MODEL}", headers=headers, json=payload, timeout=15)
+                if r.status_code == 200:
+                    resp = r.json()
+                    if isinstance(resp, list) and resp:
+                        text = resp[0].get('generated_text','')
+                    else:
+                        text = str(resp)
+                else:
+                    text = f"Erro HuggingFace {r.status_code}: {r.text[:200]}"
+            except Exception as e:
+                text = f"Erro ao chamar HuggingFace: {e}"
+        else:
+            text = "HF_TOKEN não configurado."
+    else:
+        text = ""
+    return {"answer": text, "context": context}
+
+
+if __name__ == '__main__':
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv('PORT', 8000))
     print(f"🚀 Rodando FastAPI na porta {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
+    uvicorn.run('server:app', host='0.0.0.0', port=port, log_level='info')
