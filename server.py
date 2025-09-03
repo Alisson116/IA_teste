@@ -92,180 +92,261 @@ def yt_dlp_extract(url: str, timeout=30) -> List[str]:
     except Exception:
         return []
 
-def playwright_extract(url: str, timeout=30) -> List[str]:
+
+
+
+def playwright_extract(url: str, timeout=35, max_wait_for_network=6) -> List[str]:
     """
-    Playwright agressivo: spoof UA, intercepta rede, clica em botões 'baixar/download',
-    tenta extrair URLs de players JS (jwplayer, videojs, objetos globais) e respostas XHR.
+    Playwright agressivo: hooks de fetch/XHR antes da navegação, intercepta responses,
+    simula cliques/scrolls, tenta múltiplas heurísticas (jwplayer, video tags, JSON embutido).
+    Retorna lista de links (mp4/m3u8/etc).
     """
     if not HAS_PLAYWRIGHT:
         return []
 
     collected = set()
+    attempts = {"init_hooks": False, "page_clicks": [], "xhr_hits": [], "responses": []}
+
+    hook_script = r"""
+    // coleta simples global
+    (function(){
+      window.__captured_requests = window.__captured_requests || [];
+      // hook fetch
+      const origFetch = window.fetch;
+      window.fetch = async function(input, init){
+        try{
+          const resp = await origFetch(input, init);
+          try {
+            const clone = resp.clone();
+            clone.text().then(txt=>{
+              window.__captured_requests.push({url: resp.url, status: resp.status, text: txt.substring(0,3000)});
+            }).catch(()=>{ window.__captured_requests.push({url: resp.url, status: resp.status}); });
+          }catch(e){}
+          return resp;
+        }catch(e){
+          throw e;
+        }
+      };
+      // hook XHR
+      const origX = window.XMLHttpRequest;
+      function HookedXHR(){
+        const xhr = new origX();
+        const open = xhr.open;
+        const send = xhr.send;
+        xhr.open = function(method, url){
+          this.__url = url;
+          return open.apply(this, arguments);
+        };
+        xhr.send = function(){
+          this.addEventListener('load', function(){
+            try {
+              const txt = this.responseText;
+              window.__captured_requests.push({url: this.__url, status: this.status, text: (txt||'').substring(0,3000)});
+            } catch(e){}
+          });
+          return send.apply(this, arguments);
+        };
+        return xhr;
+      }
+      window.XMLHttpRequest = HookedXHR;
+      // hook WebSocket send (log only)
+      try {
+        const OrigWS = window.WebSocket;
+        window.WebSocket = function(url, proto){
+          const ws = proto ? new OrigWS(url, proto) : new OrigWS(url);
+          try {
+            const origSend = ws.send;
+            ws.send = function(d){ try{ window.__captured_requests.push({url: url, ws_send: (''+d).substring(0,200)}); }catch(e){} return origSend.apply(this, arguments); };
+          } catch(e){}
+          return ws;
+        };
+      } catch(e){}
+    })();
+    """
+
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-            # contexto "persistente" leve: define UA e viewport
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-                viewport={"width":1280, "height":800},
-                java_script_enabled=True,
-            )
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ])
 
-            # Spoof básico: navigator.webdriver = false, languages, plugins
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => false});
-                Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR','en-US']});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-            """)
+            # várias tentativas com diferentes contextos (desktop, mobile)
+            contexts = [
+                {"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36", "viewport": {"width":1280,"height":800}, "is_mobile": False},
+                {"user_agent": "Mozilla/5.0 (Linux; Android 12; SM-A105F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36", "viewport": {"width":360,"height":780}, "is_mobile": True}
+            ]
 
-            page = context.new_page()
-
-            # coletores: intercepta respostas e extrai urls óbvias
-            def on_response(resp):
+            for ctx_conf in contexts:
                 try:
-                    rurl = resp.url
-                    ct = (resp.headers.get("content-type") or "").lower()
-                    # se for mp4 / m3u8 / playlist-like
-                    if re.search(r'\.(mp4|m3u8|m3u8\?|manifest|playlist)', rurl, flags=re.I) or \
-                       any(k in ct for k in ("mpegurl","application/vnd.apple.mpegurl","mpegurl","video/","application/json")):
-                        collected.add(rurl)
-                    # pequenas heurísticas: se resposta JSON contiver "url" ou "file"
-                    if "application/json" in ct:
+                    context = browser.new_context(
+                        user_agent=ctx_conf["user_agent"],
+                        viewport=ctx_conf["viewport"],
+                        java_script_enabled=True,
+                        ignore_https_errors=True,
+                        bypass_csp=True,
+                        extra_http_headers={"referer": url}
+                    )
+
+                    # spoof navigator
+                    context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', {get: () => false});
+                        Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR','en-US']});
+                        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+                    """)
+
+                    # add fetch/XHR hooks before navigation
+                    context.add_init_script(hook_script)
+                    attempts["init_hooks"] = True
+
+                    page = context.new_page()
+                    # attach response listener
+                    def on_response(resp):
                         try:
-                            body = resp.text()
-                            for match in re.findall(r'"?(?:file|url|source|src)"?\s*:\s*"([^"]+)"', body):
-                                if match:
-                                    collected.add(requests.compat.urljoin(url, match))
+                            rurl = resp.url
+                            ct = (resp.headers.get("content-type") or "").lower()
+                            if re.search(r'\.(mp4|m3u8|manifest|playlist)', rurl, flags=re.I) or any(k in ct for k in ("mpegurl","application/vnd.apple.mpegurl","video/","application/json")):
+                                collected.add(rurl)
+                                attempts["responses"].append(rurl)
                         except Exception:
                             pass
-                except Exception:
-                    pass
+                    page.on("response", on_response)
 
-            page.on("response", on_response)
+                    # visit
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout*1000)
 
-            # roteamento para log de requests (opcional, não modifica)
-            def on_request(req):
-                try:
-                    rurl = req.url
-                    if re.search(r'\.(mp4|m3u8|manifest|playlist)', rurl, flags=re.I):
-                        collected.add(rurl)
-                except Exception:
-                    pass
-            page.on("request", on_request)
+                    # small sleep to let inline scripts run
+                    time.sleep(0.8)
 
-            # navega e espera a rede estabilizar
-            page.goto(url, wait_until="networkidle", timeout=timeout*1000)
-
-            # 1) tenta encontrar <video>, <source> via DOM
-            try:
-                video_srcs = page.eval_on_selector_all("video, source", "els => els.map(e => e.src || e.getAttribute('src')).filter(Boolean)")
-                for s in video_srcs:
-                    if s:
-                        collected.add(requests.compat.urljoin(url, s))
-            except Exception:
-                pass
-
-            # 2) tenta detectar players JS conhecidos (jwplayer, videojs, hlsjs config)
-            try:
-                # jwplayer
-                jw = page.evaluate("""() => {
-                    try {
-                        if (window.jwplayer) {
-                            const jw = window.jwplayer();
-                            if (jw && jw.getPlaylist) {
-                                return jw.getPlaylist().map(p => p.file).filter(Boolean);
-                            }
-                        }
-                    } catch(e){}
-                    return null;
-                }""")
-                if jw:
-                    for s in jw:
-                        collected.add(requests.compat.urljoin(url, s))
-            except Exception:
-                pass
-
-            try:
-                # videojs (comuns)
-                vj = page.evaluate("""() => {
-                    try {
-                        if (window.videojs) {
-                            const vids = [];
-                            document.querySelectorAll('video').forEach(v => {
-                                if (v.currentSrc) vids.push(v.currentSrc);
-                            });
-                            return vids;
-                        }
-                    } catch(e){}
-                    return null;
-                }""")
-                if vj:
-                    for s in vj:
-                        collected.add(requests.compat.urljoin(url, s))
-            except Exception:
-                pass
-
-            # 3) procura por variáveis globais comuns / state json embutido
-            try:
-                cand = page.evaluate("""() => {
-                    const hits = [];
-                    try {
-                        // tenta algumas chaves comuns
-                        const keys = ['__PLAYER__', 'playerConfig','INITIAL_STATE','window._player'];
-                        for (const k of keys) {
-                            try {
-                                const v = window[k];
-                                if (v && typeof v === 'object') hits.push(JSON.stringify(v));
-                            } catch(e){}
-                        }
-                        // procura scripts JSON embutidos
-                        document.querySelectorAll('script[type="application/json"], script:not([src])').forEach(s => {
-                            const t = s.innerText || '';
-                            if (t.length > 50 && (t.includes('m3u8') || t.includes('mp4') || t.includes('file'))) hits.push(t);
-                        });
-                    } catch(e){}
-                    return hits.slice(0,10);
-                }""")
-                if cand:
-                    for txt in cand:
-                        for match in re.findall(r'https?:\\/\\/[^"\\s\\}]+\\.(?:m3u8|mp4)[^"\\s\\}]*', txt):
-                            collected.add(match.replace("\\/","/"))
-                        # regex plain
-                        for match in re.findall(r'(https?://[^"\\s\']+\\.(?:mp4|m3u8)[^"\\s\']*)', txt):
-                            collected.add(match)
-            except Exception:
-                pass
-
-            # 4) tenta clicar em botões / links com texto "baixar" ou "download" (pode acionar chamadas)
-            try:
-                # localiza possíveis botões/links
-                loc = page.locator("text=/baixar|download|baixar vídeo|download video/i")
-                count = loc.count()
-                for i in range(count):
+                    # Try: find video tag sources in DOM
                     try:
-                        el = loc.nth(i)
-                        el.click(timeout=3000)
-                        # aguarda eventuais XHRs que contenham m3u8/mp4
-                        try:
-                            resp = page.wait_for_response(lambda r: re.search(r'(m3u8|mp4|manifest|playlist)', r.url, flags=re.I), timeout=4000)
-                            if resp and resp.url:
-                                collected.add(resp.url)
-                        except Exception:
-                            pass
+                        vids = page.eval_on_selector_all("video, source", "els => els.map(e => e.src || e.getAttribute('src')).filter(Boolean)")
+                        for s in vids:
+                            if s:
+                                collected.add(requests.compat.urljoin(url, s))
                     except Exception:
                         pass
-            except Exception:
-                pass
 
-            # 5) espera mais um pouco por requests que o player dispare
-            time.sleep(1.2)
+                    # Try to click on play button(s) / center of video
+                    click_selectors = [
+                        "button[class*=play]", ".jw-icon-play", ".vjs-play-control", "button[aria-label*='Play']",
+                        "div.play", "button[title*='play']", "a[title*='play']"
+                    ]
+                    clicked_any = False
+                    for sel in click_selectors:
+                        try:
+                            els = page.locator(sel)
+                            if els.count() > 0:
+                                els.nth(0).scroll_into_view_if_needed()
+                                els.nth(0).click(timeout=2000)
+                                attempts["page_clicks"].append(sel)
+                                clicked_any = True
+                                # wait some XHRs
+                                try:
+                                    r = page.wait_for_response(lambda r: re.search(r'(m3u8|mp4|manifest|playlist)', r.url, flags=re.I), timeout=3000)
+                                    if r and r.url:
+                                        collected.add(r.url)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
 
-            # 6) também varre todos os requests/response capturados no contexto (já coletados por handlers)
-            # (collected já preenchido via eventos)
+                    # if no obvious button, click center of potential video container
+                    if not clicked_any:
+                        try:
+                            box = page.query_selector("video, div[class*=player], #player, .player")
+                            if box:
+                                box.click()
+                                attempts["page_clicks"].append("center_click_video")
+                                # wait requests
+                                try:
+                                    r = page.wait_for_response(lambda r: re.search(r'(m3u8|mp4|manifest|playlist)', r.url, flags=re.I), timeout=3000)
+                                    if r and r.url:
+                                        collected.add(r.url)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
 
-            # fecha
+                    # wait a little to capture background requests
+                    wait_cycles = max_wait_for_network
+                    for _ in range(wait_cycles):
+                        time.sleep(1)
+                        try:
+                            # inspect window.__captured_requests populated by hook
+                            arr = page.evaluate("() => (window.__captured_requests || []).slice(-20)")
+                            if arr:
+                                for o in arr:
+                                    u = o.get("url") if isinstance(o, dict) else None
+                                    txt = o.get("text") if isinstance(o, dict) else ""
+                                    if u and re.search(r'\.(m3u8|mp4|manifest|playlist)', u, flags=re.I):
+                                        collected.add(u)
+                                    if isinstance(txt, str):
+                                        for m in re.findall(r'https?:\\/\\/[^"\\s\\}]+\\.(?:m3u8|mp4)[^"\\s\\}]*', txt):
+                                            collected.add(m.replace("\\/","/"))
+                                        for m in re.findall(r'(https?://[^"\\s\']+\\.(?:mp4|m3u8)[^"\\s\']*)', txt):
+                                            collected.add(m)
+                                # also try to parse embedded JSON on page for direct links
+                                inline = page.evaluate("""() => {
+                                    const hits = [];
+                                    document.querySelectorAll('script:not([src])').forEach(s=>{
+                                      const t = (s.innerText||'');
+                                      if(t && (t.includes('m3u8')||t.includes('.mp4'))) hits.push(t.substring(0,4000));
+                                    });
+                                    return hits.slice(-10);
+                                }""")
+                                if inline:
+                                    for txt in inline:
+                                        for m in re.findall(r'https?:\\/\\/[^"\\s\\}]+\\.(?:m3u8|mp4)[^"\\s\\}]*', txt):
+                                            collected.add(m.replace("\\/","/"))
+                                        for m in re.findall(r'(https?://[^"\\s\']+\\.(?:mp4|m3u8)[^"\\s\']*)', txt):
+                                            collected.add(m)
+                        except Exception:
+                            pass
+
+                    # try specific player apis (jwplayer/videojs/hls)
+                    try:
+                        jw = page.evaluate("""() => {
+                            try { if (window.jwplayer) return (window.jwplayer().getPlaylist||(()=>[]))().map(p=>p.file).filter(Boolean); } catch(e){} return null;
+                        }""")
+                        if jw:
+                            for s in jw: collected.add(requests.compat.urljoin(url, s))
+                    except Exception:
+                        pass
+
+                    try:
+                        vjs = page.evaluate("""() => {
+                            try {
+                                const found = [];
+                                document.querySelectorAll('video').forEach(v => { if(v.currentSrc) found.push(v.currentSrc); });
+                                return found;
+                            } catch(e) { return null; }
+                        }""")
+                        if vjs:
+                            for s in vjs: collected.add(requests.compat.urljoin(url, s))
+                    except Exception:
+                        pass
+
+                    # close context for this attempt
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+
+                    # if we already found links, break early
+                    if collected:
+                        break
+
+                except Exception:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    continue
+
             try:
-                context.close()
                 browser.close()
             except Exception:
                 pass
@@ -273,7 +354,7 @@ def playwright_extract(url: str, timeout=30) -> List[str]:
     except Exception:
         pass
 
-    # normaliza e devolve
+    # normaliza urls
     out = []
     for u in collected:
         if not u:
@@ -282,8 +363,9 @@ def playwright_extract(url: str, timeout=30) -> List[str]:
             out.append(requests.compat.urljoin(url, u))
         except Exception:
             out.append(u)
-    # dedupe
+    # dedupe and return
     return list(dict.fromkeys(out))
+
 
 def fallback_regex(html: str, base_url: str) -> List[str]:
     matches = re.findall(r'(https?://[^\s"\'<>]+?\.(?:mp4|m3u8))', html, flags=re.I)
