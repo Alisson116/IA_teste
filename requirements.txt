@@ -1,10 +1,7 @@
-fastapi
-uvicorn[standard]
-requests
-beautifulsoup4
-lxml
-html5lib
-py-mini-racer
-yt-dlp
-playwright
-python-multipart
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+requests==2.31.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+yt-dlp==2025.08.30    # versões mudam com o tempo; garantir compatibilidade
+playwright==1.35.0    # ajuste se necessário
