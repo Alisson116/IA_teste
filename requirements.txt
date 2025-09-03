@@ -1,8 +1,9 @@
- fastapi
-uvicorn
+fastapi
+uvicorn[standard]
 requests
 beautifulsoup4
 lxml
-playwright
+html5lib
 yt-dlp
- 
+playwright
+yt_dlp

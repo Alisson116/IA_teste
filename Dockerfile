@@ -30,6 +30,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # instalar navegadores do playwright
 RUN python -m playwright install --with-deps
+# após pip install -r requirements.txt
+RUN playwright install --with-deps
 
 COPY . .
 
