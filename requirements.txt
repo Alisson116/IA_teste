@@ -4,7 +4,9 @@ requests
 beautifulsoup4
 lxml
 html5lib
-py-mini-racer
-yt-dlp
 playwright
-python-multipart
+yt-dlp
+py-mini-racer
+bs4
+typing-extensions
+aiohttp
