@@ -3,33 +3,31 @@ import os
 import time
 import json
 import re
-import base64
-import shlex
-import subprocess
-from typing import List, Dict, Any, Optional
-from urllib.parse import urljoin
+import asyncio
+import traceback
+from typing import List, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-# optional imports
+# tentativas opcionais
 try:
-    from yt_dlp import YoutubeDL
+    import yt_dlp
     HAS_YTDLP = True
 except Exception:
     HAS_YTDLP = False
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright, Error as PlaywrightError
     HAS_PLAYWRIGHT = True
 except Exception:
     HAS_PLAYWRIGHT = False
 
-app = FastAPI()
+app = FastAPI(title="Extractor + SSE")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,453 +37,458 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- helpers ----------
-def sse_message(text: str):
-    # escape newlines properly
-    safe = text.replace("\n", "\\n")
-    return f"data: {safe}\n\n"
+# -------- helpers de logging/SSE --------
+def sse_line(text: str) -> bytes:
+    # envia texto simples (já é escapado pelo JSON quando necessário)
+    return f"data: {text}\n\n".encode("utf-8")
 
-def normalize_urls(base: str, items):
+def sse_json(obj: Any) -> bytes:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
+
+# -------- utilitários de extracão --------
+def absolute_urls_from_bs4(base: str, soup: BeautifulSoup) -> List[str]:
     out = []
-    for u in items:
-        if not u: continue
-        try:
-            out.append(urljoin(base, u))
-        except Exception:
-            out.append(u)
-    # dedupe preserving order
-    seen = set()
-    out2 = []
-    for u in out:
-        if u not in seen:
-            seen.add(u)
-            out2.append(u)
-    return out2
+    def norm(url):
+        if not url: return None
+        url = url.strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        if url.startswith("/"):
+            # base origin
+            try:
+                from urllib.parse import urljoin
+                return urljoin(base, url)
+            except:
+                return None
+        if url.startswith("http"):
+            return url
+        return None
 
-# ---------- basic requests / bs4 ----------
-def basic_requests_extract(url: str, timeout=10) -> List[str]:
-    links = []
+    # <video> / <source>
+    for tag in soup.select("video source, video"):
+        src = tag.get("src") or tag.get("data-src") or tag.get("data-setup")
+        if src:
+            u = norm(src)
+            if u: out.append(u)
+
+    # <iframe src=...>
+    for iframe in soup.find_all("iframe", src=True):
+        u = norm(iframe["src"])
+        if u: out.append(u)
+
+    # a[href]
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if any(x in href for x in (".m3u8", ".mp4", ".mpd")) or href.startswith("blob:"):
+            u = norm(href)
+            if u: out.append(u)
+
+    # data attributes
+    for t in soup.find_all(attrs=True):
+        for k, v in t.attrs.items():
+            if isinstance(v, str) and any(x in v for x in (".m3u8", ".mp4", "blob:")):
+                u = norm(v)
+                if u: out.append(u)
+
+    return list(dict.fromkeys(out))
+
+def regex_find_media(html: str, base: str = None) -> List[str]:
+    out = []
+    # procura URLs óbvias .m3u8/.mp4/.mpd
+    patterns = [
+        r"https?://[^\s'\"<>]+\.m3u8[^\s'\"<>]*",
+        r"https?://[^\s'\"<>]+\.mp4[^\s'\"<>]*",
+        r"https?://[^\s'\"<>]+\.mpd[^\s'\"<>]*",
+        r"blob:[^\s'\"<>]+",
+    ]
+    for pat in patterns:
+        for m in re.findall(pat, html, flags=re.IGNORECASE):
+            out.append(m)
+    return list(dict.fromkeys(out))
+
+# -------- attempt 1: simple requests + bs4 --------
+def attempt_basic(url: str, send):
+    send("TENTANDO: requisição simples (requests/BS4)")
     try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=timeout)
-        text = r.text
-        soup = BeautifulSoup(text, "lxml")
-        # <video> and <source>
-        for v in soup.select("video"):
-            src = v.get("src")
-            if src: links.append(src)
-            for s in v.find_all("source"):
-                ss = s.get("src")
-                if ss: links.append(ss)
-        for s in soup.select("source"):
-            src = s.get("src")
-            if src: links.append(src)
-        # search inline scripts for urls
-        scripts = soup.find_all("script", src=False)
-        for s in scripts:
-            t = (s.string or "")[:4000]
-            for m in re.findall(r'https?:\\/\\/[^"\\s\\}]+\\.(?:m3u8|mp4)[^"\\s\\}]*', t):
-                links.append(m.replace("\\/","/"))
-            for m in re.findall(r'(https?://[^"\'\s>]+\\.(?:mp4|m3u8)[^"\']*)', t):
-                links.append(m)
-        # also look for direct m3u8/mp4 in HTML
-        for m in re.findall(r'https?://[^\s"\']+\.(?:m3u8|mp4)[^\s"\']*', text):
-            links.append(m)
-    except Exception:
-        pass
-    return normalize_urls(url, links)
-
-# ---------- yt-dlp attempt ----------
-def yt_dlp_extract(url: str, timeout=30) -> List[str]:
-    if not HAS_YTDLP:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        found = absolute_urls_from_bs4(url, soup)
+        if found:
+            send(f"(encontrado via basic) {len(found)} links")
+        else:
+            send("(nenhum link via basic)")
+        return found
+    except Exception as e:
+        send(f"(erro basic) {repr(e)}")
         return []
-    links = []
-    ydl_opts = {"quiet": True, "skip_download": True, "no_warnings": True}
+
+# -------- attempt 2: yt-dlp (se disponível) --------
+def attempt_ytdlp(url: str, send):
+    send("TENTANDO: yt-dlp")
+    if not HAS_YTDLP:
+        send("yt-dlp não disponível")
+        return []
     try:
-        with YoutubeDL(ydl_opts) as ydl:
+        ydl_opts = {"skip_download": True, "quiet": True, "nocheckcertificate": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # extract_info pode levantar; aceitamos dicts e listas
             info = ydl.extract_info(url, download=False)
-            # check formats
-            if isinstance(info, dict):
-                if "formats" in info and info["formats"]:
-                    for f in info["formats"]:
-                        if f.get("url"):
-                            links.append(f["url"])
-                # requested_formats (sometimes)
-                if "requested_formats" in info and info["requested_formats"]:
-                    for f in info["requested_formats"]:
-                        if f.get("url"):
-                            links.append(f["url"])
-                # direct url
-                if info.get("url"):
-                    links.append(info["url"])
-    except Exception:
-        # fallback: call yt-dlp subprocess -j (some hosts)
-        try:
-            cmd = ["yt-dlp", "--no-warnings", "-j", url]
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            if p.returncode == 0 and p.stdout:
+        links = []
+        # se info tiver 'formats'
+        if isinstance(info, dict) and "formats" in info:
+            for f in info["formats"]:
+                u = f.get("url")
+                if u:
+                    links.append(u)
+        # se info tiver 'url' direto
+        elif isinstance(info, dict) and info.get("url"):
+            links.append(info.get("url"))
+        # flat playlists
+        if links:
+            send(f"(encontrado via yt-dlp) {len(links)} links")
+        else:
+            send("(nenhum link via yt-dlp)")
+        return list(dict.fromkeys(links))
+    except Exception as e:
+        send(f"(erro yt-dlp) {repr(e)}")
+        return []
+
+# -------- attempt 3: Playwright (async) --------
+async def attempt_playwright(url: str, send, timeout_sec: int = 18):
+    send("TENTANDO: Playwright (execução JS e interceptação de rede)")
+    if not HAS_PLAYWRIGHT:
+        send("Playwright não instalado como pacote Python (ou import falhou).")
+        return []
+    collected = []
+    try:
+        async with async_playwright() as pw:
+            # tenta lançar chromium -- HEADLESS
+            try:
+                browser = await pw.chromium.launch(headless=True,
+                                                   args=[
+                                                       "--no-sandbox",
+                                                       "--disable-setuid-sandbox",
+                                                       "--disable-blink-features=AutomationControlled",
+                                                       "--disable-web-security",
+                                                       "--disable-features=IsolateOrigins,site-per-process"
+                                                   ])
+            except PlaywrightError as e:
+                send(f"(erro ao lançar navegador) {e}")
+                return []
+
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36",
+                bypass_csp=True,
+            )
+            page = await context.new_page()
+
+            # coleta requisições interessantes
+            def on_request(req):
+                u = req.url
+                if any(x in u for x in (".m3u8", ".mp4", ".mpd", "playlist", "manifest", "blob:")):
+                    collected.append(u)
+            page.on("request", on_request)
+
+            # também checa responses que trazem content-type video or m3u8
+            def on_response(resp):
                 try:
-                    j = json.loads(p.stdout)
-                    if isinstance(j, dict):
-                        if "formats" in j:
-                            for f in j["formats"]:
-                                if f.get("url"): links.append(f["url"])
-                        if j.get("url"): links.append(j["url"])
+                    ct = resp.headers.get("content-type", "")
+                    u = resp.url
+                    if ct and any(x in ct for x in ("application/vnd.apple.mpegurl", "application/x-mpegurl", "video/", "application/dash+xml")):
+                        collected.append(u)
+                except:
+                    pass
+            page.on("response", on_response)
+
+            # navegar
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=20000)
+            except Exception:
+                # fallback navegar com menos espera
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 except Exception:
                     pass
-        except Exception:
-            pass
-    return normalize_urls(url, links)
 
-# ---------- playwright aggressive ----------
-def playwright_aggressive_extract(url: str, timeout=35, headless=True, max_wait_for_network=8, try_headful_if_allowed=False, proxy: Optional[str]=None) -> List[str]:
-    """
-    Aggressive Playwright attempt:
-    - inject hooks for fetch/XHR/WebSocket send
-    - intercept responses
-    - simulate clicks (play), mouse moves, keyboard
-    - search inline scripts, base64 strings
-    """
-    if not HAS_PLAYWRIGHT:
-        return []
-    collected = set()
-    # small JS to hook fetch/XHR/WS
-    hook_script = r"""
-    (function(){
-      try{
-        window.__captured_requests = window.__captured_requests || [];
-        const origFetch = window.fetch;
-        window.fetch = async function(input, init){
-          try {
-            const resp = await origFetch(input, init);
-            try { resp.clone().text().then(t => window.__captured_requests.push({url: resp.url, status: resp.status, text: t.substring(0,3000)})); } catch(e){}
-            return resp;
-          } catch(e) { throw e; }
-        };
-      } catch(e){}
-      try {
-        const origX = window.XMLHttpRequest;
-        function HookedXHR(){
-          const xhr = new origX();
-          const open = xhr.open;
-          const send = xhr.send;
-          xhr.open = function(method, url){
-            this.__url = url;
-            return open.apply(this, arguments);
-          };
-          xhr.send = function(){
-            this.addEventListener('load', function(){
-              try { window.__captured_requests.push({url: this.__url, status: this.status, text: (this.responseText||'').substring(0,3000)}); } catch(e){}
-            });
-            return send.apply(this, arguments);
-          };
-          return xhr;
-        }
-        window.XMLHttpRequest = HookedXHR;
-      } catch(e){}
-      try {
-        const OrigWS = window.WebSocket;
-        if (OrigWS) {
-          window.WebSocket = function(url, protocols){
-            const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
-            try {
-              const origSend = ws.send;
-              ws.send = function(d){ try{ window.__captured_requests.push({url: url, ws_send: (''+d).substring(0,200)}); }catch(e){} return origSend.apply(this, arguments); };
-            } catch(e){}
-            return ws;
-          };
-        }
-      } catch(e){}
-    })();
-    """
-
-    try:
-        with sync_playwright() as p:
-            browser_args = [
-                "--no-sandbox","--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
+            # heurísticas para "acionar" player: clicar em botões comuns
+            click_selectors = [
+                "button:has-text(\"VIP\")", "button:has-text(\"VIP Player\")",
+                "button:has-text(\"PLAY\")", "button:has-text(\"Play\")",
+                "button.play", ".play", "button.btn-play", ".btn-play", "a.play"
             ]
-            chromium = p.chromium
-            playwright_launch_args = {"headless": headless, "args": browser_args}
-            if proxy:
-                playwright_launch_args["proxy"] = {"server": proxy}
-
-            browser = chromium.launch(**playwright_launch_args)
-            contexts = [
-                {"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36", "viewport": {"width":1280,"height":800}},
-                {"user_agent": "Mozilla/5.0 (Linux; Android 12; SM-A105F) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36", "viewport": {"width":412,"height":915}}
-            ]
-            for ctx in contexts:
+            for sel in click_selectors:
                 try:
-                    context = browser.new_context(user_agent=ctx["user_agent"], viewport=ctx["viewport"], ignore_https_errors=True, bypass_csp=True)
-                    # minor anti-detect
-                    context.add_init_script("""
-                        Object.defineProperty(navigator, 'webdriver', {get: () => false});
-                        Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR','en-US']});
-                        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-                    """)
-                    context.add_init_script(hook_script)
-                    page = context.new_page()
-                    # collect response urls
-                    def on_response(resp):
-                        try:
-                            rurl = resp.url
-                            ct = (resp.headers.get("content-type") or "").lower()
-                            if re.search(r'\.(mp4|m3u8|manifest|playlist)', rurl, flags=re.I) or any(k in ct for k in ("mpegurl","application/vnd.apple.mpegurl","video/","application/json")):
-                                collected.add(rurl)
-                        except Exception:
-                            pass
-                    page.on("response", on_response)
-
-                    # goto
-                    page.goto(url, wait_until="domcontentloaded", timeout=timeout*1000)
-                    time.sleep(0.6)
-
-                    # try video elements
-                    try:
-                        vids = page.eval_on_selector_all("video, source", "els => els.map(e => e.src || e.getAttribute('src')).filter(Boolean)")
-                        for s in vids:
-                            if s: collected.add(urljoin(url, s))
-                    except Exception:
-                        pass
-
-                    # try clicking on obvious controls
-                    click_selectors = [
-                        "button[class*=play]", ".jw-icon-play", ".vjs-play-control", "button[aria-label*='Play']",
-                        "div.play", "button[title*='play']", "a[title*='play']"
-                    ]
-                    clicked=False
-                    for sel in click_selectors:
-                        try:
-                            if page.locator(sel).count() > 0:
-                                page.locator(sel).first.click(timeout=2000)
-                                clicked = True
-                                # wait a bit
-                                try:
-                                    r = page.wait_for_response(lambda r: re.search(r'(m3u8|mp4|manifest|playlist)', r.url, flags=re.I), timeout=3000)
-                                    if r and r.url:
-                                        collected.add(r.url)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
-                    # if nothing clicked, attempt center click on video container
-                    if not clicked:
-                        try:
-                            box = page.query_selector("video, .player, #player, div[class*=player]")
-                            if box:
-                                box.click()
-                                time.sleep(0.8)
-                        except Exception:
-                            pass
-
-                    # wait cycles reading window.__captured_requests
-                    for _ in range(max_wait_for_network):
-                        time.sleep(1)
-                        try:
-                            arr = page.evaluate("() => (window.__captured_requests || []).slice(-40)")
-                            if arr:
-                                for o in arr:
-                                    if not isinstance(o, dict): continue
-                                    u = o.get("url")
-                                    txt = o.get("text","")
-                                    if u and re.search(r'\.(m3u8|mp4|manifest|playlist)', u, flags=re.I):
-                                        collected.add(u)
-                                    # search inside text blobs
-                                    for m in re.findall(r'https?:\\/\\/[^"\\s\\}]+\\.(?:m3u8|mp4)[^"\\s\\}]*', str(txt)):
-                                        collected.add(m.replace("\\/","/"))
-                                    for m in re.findall(r'https?://[^"\'\s>]+\\.(?:mp4|m3u8)[^"\']*', str(txt)):
-                                        collected.add(m)
-                        except Exception:
-                            pass
-
-                    # scan inline scripts for base64 -> decode heuristics
-                    try:
-                        scripts = page.evaluate("""() => Array.from(document.querySelectorAll('script:not([src])')).map(s=>s.innerText||'').slice(-20)""")
-                        for t in scripts:
-                            # find long base64-ish strings
-                            for b64 in re.findall(r'([A-Za-z0-9+/=]{120,})', t):
-                                try:
-                                    decoded = base64.b64decode(b64 + "===" ).decode("utf-8", errors="ignore")
-                                    for m in re.findall(r'https?://[^"\s\']+\.(?:m3u8|mp4)[^"\s\']*', decoded):
-                                        collected.add(m)
-                                except Exception:
-                                    pass
-                            # also general url regex
-                            for m in re.findall(r'https?://[^\s"\']+\.(?:m3u8|mp4)[^\s"\']*', t):
-                                collected.add(m)
-                    except Exception:
-                        pass
-
-                    # try common API players (jwplayer)
-                    try:
-                        jw = page.evaluate("""() => { try { if (window.jwplayer) { const pl = window.jwplayer().getPlaylist(); return pl.map(p=>p.file).filter(Boolean); } } catch(e){} return null; }""")
-                        if jw:
-                            for s in jw: collected.add(urljoin(url, s))
-                    except Exception:
-                        pass
-
-                    # try to extract from video.currentSrc
-                    try:
-                        curr = page.evaluate("""() => { try { const v = document.querySelector('video'); return v && v.currentSrc ? v.currentSrc : null } catch(e) { return null; } }""")
-                        if curr:
-                            collected.add(urljoin(url, curr))
-                    except Exception:
-                        pass
-
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-
-                    if collected:
-                        break
+                    if await page.query_selector(sel):
+                        await page.click(sel, timeout=3000)
+                        send(f"(play) clique em {sel}")
+                        await asyncio.sleep(1)
                 except Exception:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-                    continue
+                    pass
+
+            # tentar apertar espaço (alguns players respondem)
             try:
-                browser.close()
+                await page.keyboard.press("Space")
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    return normalize_urls(url, list(collected))
+            # aguardar por novas requisições
+            await asyncio.sleep(timeout_sec)
 
-# ---------- fallback regex ----------
-def fallback_regex_extract(url: str, timeout=10) -> List[str]:
-    links = []
+            # também tenta procurar na DOM por <video> tags / sources
+            try:
+                vids = await page.eval_on_selector_all("video source, video", "els => els.map(e=>e.src || e.getAttribute('data-src') || '')")
+                for v in vids:
+                    if v:
+                        collected.append(v)
+            except Exception:
+                pass
+
+            # fechar
+            await browser.close()
+
+            # normalizar
+            collected = [u for u in collected if u and u.startswith(("http", "https", "blob:"))]
+            collected = list(dict.fromkeys(collected))
+            if collected:
+                send(f"(encontrado via Playwright) {len(collected)} links")
+            else:
+                send("(nenhum link via Playwright)")
+            return collected
+    except Exception as e:
+        send(f"(erro Playwright) {repr(e)}\n{traceback.format_exc()}")
+        return []
+
+# -------- attempt 4: fallback regex na página (requests já pego, mas repetimos) --------
+def attempt_fallback_regex(url: str, send):
+    send("TENTANDO: fallback (regex/HTML)")
     try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=timeout)
-        text = r.text
-        # common playlist/file patterns
-        for m in re.findall(r'https?://[^\s"\']+\.(?:m3u8|mp4|mpd)[^\s"\']*', text):
-            links.append(m)
-        # also some JS-assembled urls (http\\u003a etc)
-        for m in re.findall(r'(https?:\\\\/\\\\/[^"\\s]+\\.(?:m3u8|mp4)[^"\\s]*)', text):
-            links.append(m.replace("\\/","/"))
-    except Exception:
-        pass
-    return normalize_urls(url, links)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(url, headers=headers, timeout=12)
+        r.raise_for_status()
+        found = regex_find_media(r.text, base=url)
+        if found:
+            send(f"(encontrado via fallback) {len(found)} links")
+        else:
+            send("nenhum link via fallback")
+        return found
+    except Exception as e:
+        send(f"(erro fallback) {repr(e)}")
+        return []
 
-# ---------- orchestration ----------
-def run_full_extraction(url: str, send_progress) -> Dict[str,Any]:
-    result = {"method":"none","links":[],"attempts":{"basic":[],"yt_dlp":[],"playwright":[],"fallback_regex":[]}}
-    # 1) basic
-    send_progress("TENTANDO: requisição simples (requests/BS4)")
-    br = basic_requests_extract(url)
-    result["attempts"]["basic"] = br
-    if br:
-        result["method"] = "basic"
-        result["links"] = br
-        return result
-
-    # 2) yt-dlp
-    send_progress("TENTANDO: yt-dlp")
-    ytd = yt_dlp_extract(url)
-    result["attempts"]["yt_dlp"] = ytd
-    if ytd:
-        result["method"] = "yt_dlp"
-        result["links"] = ytd
-        return result
-
-    # 3) Playwright
-    send_progress("TENTANDO: Playwright (execução JS e interceptação de rede)")
-    # allow override via env if you want headful tests locally
-    headless_env = os.getenv("PLAYWRIGHT_HEADLESS", "1") != "0"
-    proxy = os.getenv("EXTRACT_PROXY")  # optional proxy like http://user:pass@x.y:port
-    pl = playwright_aggressive_extract(url, headless=headless_env, proxy=proxy, max_wait_for_network=int(os.getenv("PLAYWRIGHT_WAIT", "10")))
-    result["attempts"]["playwright"] = pl
-    if pl:
-        result["method"] = "playwright"
-        result["links"] = pl
-        return result
-
-    # 4) fallback regex
-    send_progress("TENTANDO: fallback (regex/HTML)")
-    fb = fallback_regex_extract(url)
-    result["attempts"]["fallback_regex"] = fb
-    if fb:
-        result["method"] = "fallback"
-        result["links"] = fb
-        return result
-
-    return result
-
-# ---------- endpoints ----------
+# -------- endpoint utilitário --------
 @app.get("/server-info")
 def server_info():
-    features = {"yt_dlp": HAS_YTDLP, "playwright": HAS_PLAYWRIGHT}
-    return {"status":"ok","msg":"Servidor pronto","features":features}
+    features = {
+        "yt_dlp": HAS_YTDLP,
+        "playwright_pkg": HAS_PLAYWRIGHT,
+    }
+    return {"status": "ok", "msg": "Servicurl - extractor ready", "features": features}
 
+# -------- quick POST extract (sync, compat) --------
 @app.post("/extract")
-async def extract(req: Request):
-    data = await req.json()
-    url = data.get("url")
-    if not url:
-        return JSONResponse({"error":"missing url"}, status_code=400)
-    def dummy_send_progress(msg: str):
-        pass
-    result = run_full_extraction(url, dummy_send_progress)
-    return {"method": result["method"], "links": result["links"], "attempts": result["attempts"]}
+def extract_sync(req: Request):
+    """
+    Endpoint rápido para uso sem SSE. Retorna JSON com os links
+    (faz todas as tentativas de forma síncrona/simplificada).
+    """
+    data = asyncio.get_event_loop().run_until_complete(extract_workflow(req))
+    return JSONResponse(content=data)
 
+# -------- helper externo que realiza o fluxo (usado por /extract e /extract_stream_sse) --------
+async def extract_workflow(req_or_url):
+    """
+    aceita Request (FastAPI) ou string url
+    retorna dict com method/result/attempts
+    """
+    if isinstance(req_or_url, Request):
+        payload = await req_or_url.json()
+        url = payload.get("url") or payload.get("u") or payload.get("link")
+    else:
+        url = req_or_url
+
+    attempts_summary = {"basic": [], "yt_dlp": [], "playwright": [], "fallback_regex": []}
+    final_links = []
+
+    # helper local para SSE (no contexto non-sse apenas usa append logs)
+    logs = []
+
+    def send_log(msg: str):
+        logs.append(msg)
+
+    # 1) basic
+    basic = attempt_basic(url, send_log)
+    attempts_summary["basic"] = basic
+    final_links.extend(basic)
+
+    # 2) yt-dlp
+    if HAS_YTDLP:
+        ytd = attempt_ytdlp(url, send_log)
+        attempts_summary["yt_dlp"] = ytd
+        final_links.extend(ytd)
+    else:
+        send_log("yt-dlp não disponível; pulando.")
+
+    # 3) Playwright (async)
+    if HAS_PLAYWRIGHT:
+        try:
+            pw_links = await attempt_playwright(url, send_log)
+            attempts_summary["playwright"] = pw_links
+            final_links.extend(pw_links)
+        except Exception as e:
+            send_log(f"erro geral Playwright: {repr(e)}")
+    else:
+        send_log("Playwright pacote ausente ou não importável; pulando.")
+
+    # 4) fallback regex
+    fallback = attempt_fallback_regex(url, send_log)
+    attempts_summary["fallback_regex"] = fallback
+    final_links.extend(fallback)
+
+    # dedupe e filtro
+    final_links = [l for l in dict.fromkeys(final_links) if l]
+
+    method = "none"
+    if final_links:
+        # heurística: se tiver m3u8, prioriza
+        if any(".m3u8" in l for l in final_links):
+            method = "m3u8"
+        elif any(l.endswith(".mp4") or ".mp4" in l for l in final_links):
+            method = "mp4"
+        else:
+            method = "found"
+
+    result = {"method": method, "links": final_links, "attempts": attempts_summary, "logs": logs}
+    return {"status":"done", "result": result}
+
+# -------- SSE streaming endpoint --------
 @app.get("/extract_stream_sse")
-async def extract_stream_sse(url: str):
-    def event_stream():
-        def send_progress(msg: str):
-            yield sse_message(msg)
-        # we want to yield messages sequentially, so wrap calls to run_full_extraction manually
-        # We'll re-implement orchestration here so we can yield intermediate SSE messages.
-        yield sse_message("Iniciando extração...")
-        # 1 basic
-        yield sse_message("TENTANDO: requisição simples (requests/BS4)")
-        br = basic_requests_extract(url)
-        if br:
-            yield sse_message(f"(nenhum link via basic)" if not br else f"Links via basic: {json.dumps(br[:6])}")
-            yield sse_message(json.dumps({"status":"done","result":{"method":"basic","links":br,"attempts":{"basic":br}}}))
-            yield sse_message("[DONE]")
-            return
-        else:
-            yield sse_message("(nenhum link via basic)")
+async def extract_stream_sse(url: str = Query(..., description="URL to extract")):
+    """
+    SSE endpoint: vai emitindo mensagens de progresso (strings) e no final envia JSON com 'status':'done' e resultado.
+    Uso: curl -N "https://<host>/extract_stream_sse?url=..."
+    """
+    async def event_gen():
+        # start
+        yield sse_line("Iniciando extração...")
+        # We'll stream logs from extract_workflow by using a small bridging mechanism:
+        # Instead of reimplementing all attempts here, call extract_workflow but substitute send_log to yield...
+        # To keep code simple and robust we will replicate calls but streaming.
+        try:
+            # basic
+            yield sse_line("TENTANDO: requisição simples (requests/BS4)")
+            try:
+                headers = {"User-Agent": "Mozilla/5.0"}
+                r = requests.get(url, headers=headers, timeout=15)
+                r.raise_for_status()
+                soup = BeautifulSoup(r.text, "lxml")
+                basic = absolute_urls_from_bs4(url, soup)
+                if basic:
+                    yield sse_line(f"(encontrado via basic) {len(basic)} links")
+                else:
+                    yield sse_line("(nenhum link via basic)")
+            except Exception as e:
+                basic = []
+                yield sse_line(f"(erro basic) {repr(e)}")
 
-        # 2 yt-dlp
-        yield sse_message("TENTANDO: yt-dlp")
-        ytd = yt_dlp_extract(url)
-        if ytd:
-            yield sse_message(f"Links via yt-dlp: {json.dumps(ytd[:6])}")
-            yield sse_message(json.dumps({"status":"done","result":{"method":"yt_dlp","links":ytd,"attempts":{"yt_dlp":ytd}}}))
-            yield sse_message("[DONE]")
-            return
-        else:
-            yield sse_message("(nenhum link via yt-dlp)")
+            # yt-dlp
+            if HAS_YTDLP:
+                yield sse_line("TENTANDO: yt-dlp")
+                try:
+                    ytd_links = []
+                    ydl_opts = {"skip_download": True, "quiet": True, "nocheckcertificate": True}
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                    if isinstance(info, dict) and "formats" in info:
+                        for f in info["formats"]:
+                            u = f.get("url")
+                            if u:
+                                ytd_links.append(u)
+                    elif isinstance(info, dict) and info.get("url"):
+                        ytd_links.append(info.get("url"))
+                    if ytd_links:
+                        yield sse_line(f"(encontrado via yt-dlp) {len(ytd_links)} links")
+                    else:
+                        yield sse_line("(nenhum link via yt-dlp)")
+                except Exception as e:
+                    ytd_links = []
+                    yield sse_line(f"(erro yt-dlp) {repr(e)}")
+            else:
+                ytd_links = []
+                yield sse_line("yt-dlp não disponível; pulando.")
 
-        # 3 Playwright
-        yield sse_message("TENTANDO: Playwright (execução JS e interceptação de rede)")
-        headless_env = os.getenv("PLAYWRIGHT_HEADLESS", "1") != "0"
-        proxy = os.getenv("EXTRACT_PROXY")
-        pl = playwright_aggressive_extract(url, headless=headless_env, proxy=proxy, max_wait_for_network=int(os.getenv("PLAYWRIGHT_WAIT","10")))
-        if pl:
-            yield sse_message(f"Links via Playwright: {json.dumps(pl[:6])}")
-            yield sse_message(json.dumps({"status":"done","result":{"method":"playwright","links":pl,"attempts":{"playwright":pl}}}))
-            yield sse_message("[DONE]")
-            return
-        else:
-            yield sse_message("(nenhum link via Playwright)")
+            # Playwright (stream logs as we go)
+            pw_links = []
+            if HAS_PLAYWRIGHT:
+                yield sse_line("TENTANDO: Playwright (execução JS e interceptação de rede)")
+                try:
+                    # run playwright attempt_playwright but capture its internal send_log by passing a wrapper
+                    async def send(msg):
+                        yield sse_line(msg)  # can't yield from nested, so we'll collect differently
+                    # simpler: call attempt_playwright and then fetch logs from returned messages
+                    # BUT attempt_playwright uses send_log closures - to keep things simple we call it and then stream a final status
+                    pw_links = await attempt_playwright(url, lambda m: None, timeout_sec=12)
+                    if pw_links:
+                        yield sse_line(f"(encontrado via Playwright) {len(pw_links)} links")
+                    else:
+                        yield sse_line("(nenhum link via Playwright)")
+                except Exception as e:
+                    yield sse_line(f"(erro Playwright) {repr(e)}")
+            else:
+                yield sse_line("Playwright pacote ausente; pulando.")
 
-        # 4 fallback
-        yield sse_message("TENTANDO: fallback (regex/HTML)")
-        fb = fallback_regex_extract(url)
-        if fb:
-            yield sse_message(f"Links via fallback: {json.dumps(fb[:6])}")
-            yield sse_message(json.dumps({"status":"done","result":{"method":"fallback","links":fb,"attempts":{"fallback_regex":fb}}}))
-            yield sse_message("[DONE]")
-            return
-        else:
-            yield sse_message("nenhum link encontrado em todas as tentativas.")
-            yield sse_message(json.dumps({"status":"done","result":{"method":"none","links":[],"attempts":{"basic":[], "yt_dlp":[], "playwright":[], "fallback_regex":[]}}}))
-            yield sse_message("[DONE]")
+            # fallback regex
+            yield sse_line("TENTANDO: fallback (regex/HTML)")
+            try:
+                headers = {"User-Agent": "Mozilla/5.0"}
+                r2 = requests.get(url, headers=headers, timeout=12)
+                r2.raise_for_status()
+                fallback_links = regex_find_media(r2.text, base=url)
+                if fallback_links:
+                    yield sse_line(f"(encontrado via fallback) {len(fallback_links)} links")
+                else:
+                    yield sse_line("nenhum link via fallback")
+            except Exception as e:
+                fallback_links = []
+                yield sse_line(f"(erro fallback) {repr(e)}")
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            # combine
+            final = list(dict.fromkeys((basic or []) + (ytd_links or []) + (pw_links or []) + (fallback_links or [])))
+            if final:
+                # prefer m3u8 if present
+                if any(".m3u8" in u for u in final):
+                    method = "m3u8"
+                elif any(".mp4" in u for u in final):
+                    method = "mp4"
+                else:
+                    method = "found"
+            else:
+                method = "none"
+
+            yield sse_json({"status": "done", "result": {"method": method, "links": final,
+                                                          "attempts": {"basic": basic, "yt_dlp": ytd_links,
+                                                                       "playwright": pw_links, "fallback_regex": fallback_links}}})
+        except Exception as e:
+            yield sse_line(f"Erro interno: {repr(e)}")
+            yield sse_json({"status": "error", "error": str(e)})
+        # final marker for some clients
+        yield sse_line("[DONE]")
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+# -------- shim endpoint used earlier by front-end (generate_stream + SSE start) --------
+@app.post("/generate_stream")
+def generate_stream_start(req: Request):
+    # apenas confirma recebimento do prompt (compat)
+    return {"status": "ok"}
+
+@app.get("/generate_stream_sse")
+async def generate_stream_sse(prompt: str = Query(...)):
+    # simple demo that replies fragments (kept for compat with previous front-end)
+    async def gen():
+        for i in range(5):
+            yield sse_line(f"Parte {i+1} do texto para: {prompt}")
+            await asyncio.sleep(0.9)
+        yield sse_line("[DONE]")
+    return StreamingResponse(gen(), media_type="text/event-stream")
